@@ -30,6 +30,7 @@
 #include "watch_private_display.h"
 
 static void inver58_display_character(uint8_t character, uint8_t position) {
+    // Same character normalization logic as the standard renderer
     if (position == 4 || position == 6) {
         if (character == '7') character = '&';
         else if (character == 'A') character = 'a';
@@ -62,6 +63,7 @@ static void inver58_display_character(uint8_t character, uint8_t position) {
         if (character == 'R') character = 'r';
     }
     if (position == 0) {
+        // normal renderer clears this; for inversion, set it
         watch_set_pixel(0, 15);
     } else {
         if (character == 'I') character = 'l';
@@ -88,6 +90,7 @@ static void inver58_display_character(uint8_t character, uint8_t position) {
         segdata = segdata >> 1;
     }
 
+    // Invert the special-case extra segments from the normal renderer
     if (character == 'T' && position == 1) watch_clear_pixel(1, 12);
     else if (position == 0 && (character == 'B' || character == 'D' || character == '@')) watch_clear_pixel(0, 15);
     else if (position == 1 && (character == 'B' || character == 'D' || character == '@')) watch_clear_pixel(0, 12);
@@ -155,14 +158,20 @@ void inver58_face_activate(movement_settings_t *settings, void *context) {
     else watch_set_indicator(WATCH_INDICATOR_24H);
 #endif
 
+    // handle chime indicator (inverted)
     if (state->signal_enabled) watch_clear_indicator(WATCH_INDICATOR_BELL);
     else watch_set_indicator(WATCH_INDICATOR_BELL);
 
+    // show alarm indicator if there is an active alarm (inverted)
     _update_alarm_indicator(settings->bit.alarm_enabled, state);
 
+    // colon inverted
     watch_clear_colon();
 
-    state->previous_date_time = 0xFFFFFFFF;
+    // force full re-render
+    state->previous_minute = 0xFF;
+    state->previous_second = 0xFF;
+    state->previous_day_date = 0xFF;
 }
 
 bool inver58_face_loop(movement_event_t event, movement_settings_t *settings, void *context) {
@@ -171,21 +180,26 @@ bool inver58_face_loop(movement_event_t event, movement_settings_t *settings, vo
     uint8_t pos;
 
     watch_date_time date_time;
-    uint32_t previous_date_time;
     switch (event.event_type) {
         case EVENT_ACTIVATE:
         case EVENT_TICK:
         case EVENT_LOW_ENERGY_UPDATE:
             date_time = watch_rtc_get_date_time();
-            previous_date_time = state->previous_date_time;
-            state->previous_date_time = date_time.reg;
+            uint8_t prev_min = state->previous_minute;
+            uint8_t prev_sec = state->previous_second;
+            uint8_t prev_day_date = state->previous_day_date;
+            state->previous_minute = date_time.unit.minute;
+            state->previous_second = date_time.unit.second;
+            state->previous_day_date = (date_time.unit.hour << 5) | date_time.unit.day;
 
+            // Blink colon at 1 Hz in active mode
             if (event.event_type != EVENT_LOW_ENERGY_UPDATE) {
                 if ((date_time.unit.second & 1) == 0) watch_set_colon();
                 else watch_clear_colon();
             }
 
-            if (date_time.unit.day != state->last_battery_check) {
+            // check the battery voltage once a week (on day change when day % 7 == 0)
+            if (date_time.unit.day != state->last_battery_check && (date_time.unit.day % 7) == 0) {
                 state->last_battery_check = date_time.unit.day;
                 watch_enable_adc();
                 uint16_t voltage = watch_get_vcc_voltage();
@@ -193,18 +207,29 @@ bool inver58_face_loop(movement_event_t event, movement_settings_t *settings, vo
                 state->battery_low = (voltage < 2200);
             }
 
+            // set the LAP indicator inverted: on when battery is NOT low
             if (state->battery_low) watch_clear_indicator(WATCH_INDICATOR_LAP);
             else watch_set_indicator(WATCH_INDICATOR_LAP);
 
             bool set_leading_zero = false;
-            if ((date_time.reg >> 6) == (previous_date_time >> 6) && event.event_type != EVENT_LOW_ENERGY_UPDATE) {
+            bool seconds_only = (date_time.unit.minute == prev_min && prev_sec != date_time.unit.second && 
+                                 state->previous_day_date == ((date_time.unit.hour << 5) | date_time.unit.day) &&
+                                 event.event_type != EVENT_LOW_ENERGY_UPDATE);
+            bool minutes_only = (date_time.unit.minute != prev_min && 
+                                 state->previous_day_date == ((date_time.unit.hour << 5) | date_time.unit.day) &&
+                                 event.event_type != EVENT_LOW_ENERGY_UPDATE);
+            
+            if (seconds_only) {
+                // seconds changed only
                 inver58_display_character_lp_seconds('0' + date_time.unit.second / 10, 8);
                 inver58_display_character_lp_seconds('0' + date_time.unit.second % 10, 9);
                 break;
-            } else if ((date_time.reg >> 12) == (previous_date_time >> 12) && event.event_type != EVENT_LOW_ENERGY_UPDATE) {
+            } else if (minutes_only) {
+                // minutes changed only
                 pos = 6;
                 sprintf(buf, "%02d%02d", date_time.unit.minute, date_time.unit.second);
             } else {
+                // full refresh
 #ifndef CLOCK_FACE_24H_ONLY
                 if (!settings->bit.clock_mode_24h) {
                     if (date_time.unit.hour < 12) {
@@ -232,6 +257,8 @@ bool inver58_face_loop(movement_event_t event, movement_settings_t *settings, vo
             inver58_display_string(buf, pos);
 
             if (set_leading_zero) inver58_display_string("0", 4);
+
+            // handle alarm indicator
             if (state->alarm_enabled != settings->bit.alarm_enabled) _update_alarm_indicator(settings->bit.alarm_enabled, state);
             break;
         case EVENT_ALARM_LONG_PRESS:
@@ -240,6 +267,7 @@ bool inver58_face_loop(movement_event_t event, movement_settings_t *settings, vo
             else watch_set_indicator(WATCH_INDICATOR_BELL);
             break;
         case EVENT_BACKGROUND_TASK:
+            // movement_move_to_face(state->watch_face_index);
             movement_play_signal();
             break;
         default:
